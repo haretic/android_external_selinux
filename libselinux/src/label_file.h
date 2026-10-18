@@ -423,6 +423,30 @@ static inline int compile_regex(struct spec *spec, const char **errbuf)
 	return 0;
 }
 
+/* Whether the anchored regex could match the subset prefix or a path under
+ * it. A prefix ending in '/' also keeps regexes matching the prefix without
+ * the slash (the directory itself). Keeps the spec when unsure. */
+static inline bool spec_may_match_prefix(const char *regex, const char *prefix)
+{
+	struct spec probe = { .regex_str = (char *)regex };
+	size_t plen = strlen(prefix);
+	bool keep = true;
+
+	__pthread_mutex_init(&probe.regex_lock, NULL);
+	if (compile_regex(&probe, NULL) == 0) {
+		keep = regex_match(probe.regex, prefix, true) != REGEX_NO_MATCH;
+		if (!keep && plen > 1 && prefix[plen - 1] == '/') {
+			char *dir = strndup(prefix, plen - 1);
+
+			keep = !dir || regex_match(probe.regex, dir, false) != REGEX_NO_MATCH;
+			free(dir);
+		}
+		regex_data_free(probe.regex);
+	}
+	__pthread_mutex_destroy(&probe.regex_lock);
+	return keep;
+}
+
 /* This service is used by label_file.c process_file() and
  * utils/sefcontext_compile.c */
 static inline int process_line(struct selabel_handle *rec,
@@ -473,6 +497,16 @@ static inline int process_line(struct selabel_handle *rec,
 	len = get_stem_from_spec(regex);
 	if (len && prefix && strncmp(prefix, regex, len)) {
 		/* Stem of regex does not match requested prefix, discard. */
+		free(regex);
+		free(type);
+		free(context);
+		return 0;
+	}
+	if (!len && prefix && !spec_may_match_prefix(regex, prefix)) {
+		/* No stem, but the regex cannot match anything under the
+		 * requested prefix either, e.g. "/(vendor|system/vendor)/..."
+		 * for "/sys/". Without this every lookup on a subset handle
+		 * still runs such regexes. */
 		free(regex);
 		free(type);
 		free(context);
